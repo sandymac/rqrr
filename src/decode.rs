@@ -358,8 +358,15 @@ fn codestream_ecc(meta: &MetaData, ds: RawData) -> DeQRResult<CorrectedDataStrea
         let dst = &mut out.data[dst_offset..(dst_offset + ecc.bs)];
         let num_ec = ecc.bs - ecc.dw;
         #[allow(clippy::needless_range_loop)]
-        for j in 0..ecc.dw {
+        for j in 0..sb_ecc.dw {
             dst[j] = ds.data[j * bc + i];
+        }
+        // A long block carries exactly one more data codeword than a short
+        // one. Once the short blocks have run out, interleaving skips them, so
+        // those final codewords sit in a compact run right after the common
+        // columns rather than in a column of their own.
+        if ecc.dw > sb_ecc.dw {
+            dst[sb_ecc.dw] = ds.data[sb_ecc.dw * bc + (i - sb_ecc.ns)];
         }
         for j in 0..num_ec {
             dst[ecc.dw + j] = ds.data[ecc_offset + j * bc + i];
@@ -894,5 +901,103 @@ mod tests {
                 assert_eq!(test[y][x] != 0, mask_bit(7, y, x));
             }
         }
+    }
+
+    /// Systematic Reed-Solomon encode, producing the `npar` error correction
+    /// codewords that follow `data` in a block. Uses the same generator roots
+    /// (alpha^0 .. alpha^(npar - 1)) that `block_syndromes` evaluates at.
+    fn rs_encode(data: &[u8], npar: usize) -> Vec<u8> {
+        let mut gen = vec![GF256::ONE];
+        for i in 0..npar {
+            let root = GF256::GENERATOR.pow(i);
+            gen.push(GF256::ZERO);
+            for j in (1..gen.len()).rev() {
+                let carry = gen[j - 1] * root;
+                gen[j] += carry;
+            }
+        }
+
+        let mut rem: Vec<GF256> = data.iter().map(|&b| GF256(b)).collect();
+        rem.resize(data.len() + npar, GF256::ZERO);
+        for i in 0..data.len() {
+            let coeff = rem[i];
+            if coeff == GF256::ZERO {
+                continue;
+            }
+            for (j, &g) in gen.iter().enumerate() {
+                rem[i + j] += g * coeff;
+            }
+        }
+        rem[data.len()..].iter().map(|g| g.0).collect()
+    }
+
+    #[test]
+    fn test_deinterleave_mixed_block_sizes() {
+        // Version 7-Q has two block sizes: 2 blocks of (32, 14) and 4 blocks
+        // of (33, 15), so the four long blocks each carry one extra data
+        // codeword.
+        let meta = MetaData {
+            version: Version(7),
+            ecc_level: 3,
+            mask: 0,
+        };
+        let ver = &VERSION_DATA_BASE[meta.version.0];
+        let sb_ecc = &ver.ecc[meta.ecc_level as usize];
+        let lb_count = (ver.data_bytes - sb_ecc.bs * sb_ecc.ns) / (sb_ecc.bs + 1);
+        assert_eq!((sb_ecc.bs, sb_ecc.dw, sb_ecc.ns, lb_count), (32, 14, 2, 4));
+        let bc = sb_ecc.ns + lb_count;
+        let npar = sb_ecc.bs - sb_ecc.dw;
+
+        // Build every block, each data codeword distinguishable from every
+        // other, and give each block its real error correction codewords.
+        let mut data = Vec::new();
+        let mut ecc = Vec::new();
+        for i in 0..bc {
+            let dw = if i < sb_ecc.ns {
+                sb_ecc.dw
+            } else {
+                sb_ecc.dw + 1
+            };
+            let block: Vec<u8> = (0..dw).map(|j| (i * 16 + j + 1) as u8).collect();
+            ecc.push(rs_encode(&block, npar));
+            data.push(block);
+        }
+
+        // Interleave per ISO/IEC 18004 section 8.6: one data codeword from
+        // every block in turn, skipping blocks that have run out - so the long
+        // blocks' final data codewords form a compact run at the end of the
+        // data codewords - then the same over the error correction codewords.
+        let mut raw = RawData {
+            data: [0; MAX_PAYLOAD_SIZE],
+            len: 0,
+        };
+        let mut pos = 0;
+        for j in 0..=sb_ecc.dw {
+            for block in &data {
+                if j < block.len() {
+                    raw.data[pos] = block[j];
+                    pos += 1;
+                }
+            }
+        }
+        for j in 0..npar {
+            for block in &ecc {
+                raw.data[pos] = block[j];
+                pos += 1;
+            }
+        }
+        assert_eq!(pos, ver.data_bytes);
+        raw.len = pos * 8;
+
+        // Damage the first long block up to - but not past - what its error
+        // correction can repair.
+        for j in 0..(npar / 2) {
+            raw.data[j * bc + sb_ecc.ns] ^= 0xff;
+        }
+
+        let out = codestream_ecc(&meta, raw).expect("a block damaged to its limit must decode");
+        let expected: Vec<u8> = data.concat();
+        assert_eq!(out.bit_len, expected.len() * 8);
+        assert_eq!(&out.data[..expected.len()], &expected[..]);
     }
 }
