@@ -931,25 +931,23 @@ mod tests {
         rem[data.len()..].iter().map(|g| g.0).collect()
     }
 
-    #[test]
-    fn test_deinterleave_mixed_block_sizes() {
-        // Version 7-Q has two block sizes: 2 blocks of (32, 14) and 4 blocks
-        // of (33, 15), so the four long blocks each carry one extra data
-        // codeword.
+    /// Build the symbol at this version and error correction level, damage
+    /// one long block by exactly as many codewords as its error correction can
+    /// repair, and check that every data codeword comes back in order.
+    fn check_damaged_long_block(version: usize, ecc_level: u16) {
         let meta = MetaData {
-            version: Version(7),
-            ecc_level: 3,
+            version: Version(version),
+            ecc_level,
             mask: 0,
         };
-        let ver = &VERSION_DATA_BASE[meta.version.0];
-        let sb_ecc = &ver.ecc[meta.ecc_level as usize];
+        let ver = &VERSION_DATA_BASE[version];
+        let sb_ecc = &ver.ecc[ecc_level as usize];
         let lb_count = (ver.data_bytes - sb_ecc.bs * sb_ecc.ns) / (sb_ecc.bs + 1);
-        assert_eq!((sb_ecc.bs, sb_ecc.dw, sb_ecc.ns, lb_count), (32, 14, 2, 4));
         let bc = sb_ecc.ns + lb_count;
         let npar = sb_ecc.bs - sb_ecc.dw;
 
-        // Build every block, each data codeword distinguishable from every
-        // other, and give each block its real error correction codewords.
+        // Build every block, each data codeword distinguishable from its
+        // neighbours, and give each block its real error correction codewords.
         let mut data = Vec::new();
         let mut ecc = Vec::new();
         for i in 0..bc {
@@ -958,7 +956,7 @@ mod tests {
             } else {
                 sb_ecc.dw + 1
             };
-            let block: Vec<u8> = (0..dw).map(|j| (i * 16 + j + 1) as u8).collect();
+            let block: Vec<u8> = (0..dw).map(|j| (i * 251 + j * 97 + 1) as u8).collect();
             ecc.push(rs_encode(&block, npar));
             data.push(block);
         }
@@ -967,21 +965,29 @@ mod tests {
         // every block in turn, skipping blocks that have run out - so the long
         // blocks' final data codewords form a compact run at the end of the
         // data codewords - then the same over the error correction codewords.
+        // Note where the first long block's codewords land as we go.
         let mut raw = RawData {
             data: [0; MAX_PAYLOAD_SIZE],
             len: 0,
         };
+        let mut target = Vec::new();
         let mut pos = 0;
         for j in 0..=sb_ecc.dw {
-            for block in &data {
+            for (i, block) in data.iter().enumerate() {
                 if j < block.len() {
+                    if i == sb_ecc.ns {
+                        target.push(pos);
+                    }
                     raw.data[pos] = block[j];
                     pos += 1;
                 }
             }
         }
         for j in 0..npar {
-            for block in &ecc {
+            for (i, block) in ecc.iter().enumerate() {
+                if i == sb_ecc.ns {
+                    target.push(pos);
+                }
                 raw.data[pos] = block[j];
                 pos += 1;
             }
@@ -989,15 +995,40 @@ mod tests {
         assert_eq!(pos, ver.data_bytes);
         raw.len = pos * 8;
 
-        // Damage the first long block up to - but not past - what its error
-        // correction can repair.
-        for j in 0..(npar / 2) {
-            raw.data[j * bc + sb_ecc.ns] ^= 0xff;
+        // Damage that block up to - but not past - what it can repair.
+        for &p in &target[..npar / 2] {
+            raw.data[p] ^= 0xff;
         }
 
-        let out = codestream_ecc(&meta, raw).expect("a block damaged to its limit must decode");
+        let out = codestream_ecc(&meta, raw).unwrap_or_else(|e| {
+            panic!("version {version} level {ecc_level} damaged to its limit: {e:?}")
+        });
         let expected: Vec<u8> = data.concat();
         assert_eq!(out.bit_len, expected.len() * 8);
-        assert_eq!(&out.data[..expected.len()], &expected[..]);
+        assert_eq!(
+            &out.data[..expected.len()],
+            &expected[..],
+            "version {version} level {ecc_level}"
+        );
+    }
+
+    #[test]
+    fn test_deinterleave_mixed_block_sizes() {
+        // Every version and error correction level whose blocks come in two
+        // sizes, so that the long blocks each carry one extra data codeword.
+        // Version 7-Q, for example, has 2 blocks of (32, 14) and 4 of (33, 15).
+        let mut checked = 0;
+        for version in 1..VERSION_DATA_BASE.len() {
+            for ecc_level in 0..4 {
+                let ver = &VERSION_DATA_BASE[version];
+                let sb_ecc = &ver.ecc[ecc_level as usize];
+                if (ver.data_bytes - sb_ecc.bs * sb_ecc.ns) / (sb_ecc.bs + 1) > 0 {
+                    check_damaged_long_block(version, ecc_level);
+                    checked += 1;
+                }
+            }
+        }
+        // 128 of the 160 version/level combinations have two block sizes.
+        assert_eq!(checked, 128);
     }
 }
